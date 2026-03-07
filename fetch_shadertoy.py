@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -25,6 +26,8 @@ UA = (
 VIEW_URL = "https://www.shadertoy.com/view/{shader_id}"
 API_URL = "https://www.shadertoy.com/api/v1/shaders/{shader_id}?key={api_key}"
 POST_URL = "https://www.shadertoy.com/shadertoy"
+_DEFAULT_REQUEST_ATTEMPTS = 3
+_RETRIABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,27 +138,60 @@ def legacy_post_data(shader_id: str) -> Dict[str, str]:
     }
 
 
+def _request_with_retries(
+    session: requests.Session,
+    url: str,
+    method: str = "GET",
+    data: Optional[Dict[str, str]] = None,
+    attempts: int = _DEFAULT_REQUEST_ATTEMPTS,
+    **request_kwargs: Any,
+) -> Optional[requests.Response]:
+    total_attempts = max(1, int(attempts))
+    for attempt in range(1, total_attempts + 1):
+        try:
+            if method == "GET":
+                resp = session.get(url, **request_kwargs)
+            else:
+                resp = session.post(url, data=data, **request_kwargs)
+        except requests.RequestException:
+            if attempt < total_attempts:
+                time.sleep(min(0.7 * attempt, 2.0))
+                continue
+            return None
+
+        if resp.status_code in _RETRIABLE_STATUS_CODES and attempt < total_attempts:
+            resp.close()
+            time.sleep(min(0.7 * attempt, 2.0))
+            continue
+        return resp
+    return None
+
+
 def try_request_json(
     session: requests.Session,
     url: str,
     method: str = "GET",
     data: Optional[Dict[str, str]] = None,
 ) -> Optional[Any]:
-    try:
-        if method == "GET":
-            resp = session.get(url, timeout=20)
-        else:
-            resp = session.post(url, data=data, timeout=20)
-    except requests.RequestException:
+    resp = _request_with_retries(
+        session=session,
+        url=url,
+        method=method,
+        data=data,
+        attempts=_DEFAULT_REQUEST_ATTEMPTS,
+        timeout=20,
+    )
+    if resp is None:
         return None
 
-    if resp.status_code != 200:
-        return None
-
     try:
+        if resp.status_code != 200:
+            return None
         return resp.json()
     except json.JSONDecodeError:
         return None
+    finally:
+        resp.close()
 
 
 def extract_shader_obj(payload: Any) -> Optional[Dict[str, Any]]:
@@ -423,26 +459,37 @@ def download_assets(
         status = "ok"
         error = ""
 
-        try:
-            resp = session.get(url, timeout=40, stream=True, headers={"Accept": "*/*"})
-            if resp.status_code != 200:
-                status = "failed"
-                error = f"HTTP {resp.status_code}"
-            elif is_cloudflare_blocked_response(resp):
-                status = "failed"
-                error = "Blocked by Cloudflare challenge"
-            else:
-                with target.open("wb") as fp:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            fp.write(chunk)
-                if target.stat().st_size <= 0:
-                    status = "failed"
-                    error = "Empty response body"
-                    target.unlink(missing_ok=True)
-        except requests.RequestException as exc:
+        resp = _request_with_retries(
+            session=session,
+            url=url,
+            method="GET",
+            attempts=2,
+            timeout=40,
+            stream=True,
+            headers={"Accept": "*/*"},
+        )
+        if resp is None:
             status = "failed"
-            error = str(exc)
+            error = "Request failed after retries"
+        else:
+            try:
+                if resp.status_code != 200:
+                    status = "failed"
+                    error = f"HTTP {resp.status_code}"
+                elif is_cloudflare_blocked_response(resp):
+                    status = "failed"
+                    error = "Blocked by Cloudflare challenge"
+                else:
+                    with target.open("wb") as fp:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                fp.write(chunk)
+                    if target.stat().st_size <= 0:
+                        status = "failed"
+                        error = "Empty response body"
+                        target.unlink(missing_ok=True)
+            finally:
+                resp.close()
 
         if status == "ok":
             downloaded += 1
