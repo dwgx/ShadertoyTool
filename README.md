@@ -126,6 +126,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 资源下载同样支持浏览器回退：先用 requests 直接下载，403 失败的资源会自动通过浏览器重试。
 
+## Privacy And Account Boundary
+
+This tool can use a Shadertoy API key, browser cookies, and Playwright fallback flows. Treat those as local-only credentials.
+
+- Do not paste API keys or cookies into issues, logs, screenshots, or commits.
+- Browser cookie access is only for local Shadertoy requests from your own machine.
+- Downloaded shader assets may have their own author/license expectations; keep source URLs and manifests when sharing results.
+- If a shader requires login or fails behind Cloudflare, prefer documenting the failure mode over hardcoding personal session data.
+
 ## License
 
 [MIT](LICENSE)
